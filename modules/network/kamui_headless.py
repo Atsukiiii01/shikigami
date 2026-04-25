@@ -10,11 +10,11 @@ def execute_kamui_scan(ip_address, scan_type="pulse"):
     nm = nmap.PortScanner()
     
     # Gear Shifting: Determine scan depth based on the engine's request
+    # Gear Shifting: Determine scan depth based on the engine's request
     if scan_type == "pulse":
-        # Fast baseline check (Top 100 ports, fast timing)
-        scan_args = '-F -T4'
+        # Fast baseline check: Explicitly target top web and infrastructure ports
+        scan_args = '-p 21,22,80,443,8000,8080,8443 -T4'
         print(f"[*] [KAMUI] Executing Pulse Scan on {ip_address}...")
-    elif scan_type == "interrogation":
         # Deep inspection (All ports, service versions)
         scan_args = '-p- -sV -T4'
         print(f"[*] [KAMUI] Executing Deep Interrogation on {ip_address}...")
