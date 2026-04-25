@@ -3,83 +3,77 @@ import json
 from datetime import datetime
 
 class ShikigamiCore:
-    def __init__(self, db_name="shikigami_state.db"):
-        """Initializes the engine and connects to the foundational memory."""
-        # THE FIX: Allow APScheduler worker threads to interact with the main thread's DB
+    def __init__(self, db_name="data/shikigami_state.db"):
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
         self.cursor = self.conn.cursor()
-        self._build_foundation()
+        self._build_schema()
 
-    def _build_foundation(self):
-        """Creates the absolute bare-metal tables required for a state-aware engine."""
+    def _build_schema(self):
+        """
+        Upgraded Schema: Tracks generic targets (IPs or Subdomains), 
+        their parent root domains, and continuous state.
+        """
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS assets (
-                ip_address TEXT PRIMARY KEY,
-                first_seen TEXT,
-                last_seen TEXT,
-                open_ports TEXT,  
-                service_hash TEXT
+                target TEXT PRIMARY KEY,
+                asset_type TEXT,
+                root_domain TEXT,
+                open_ports TEXT,
+                state_hash TEXT,
+                discovered_at TEXT,
+                last_scanned TEXT
             )
         ''')
+        self.conn.commit()
+
+    def add_asset(self, target, asset_type="ip", root_domain=None):
+        """
+        Registers a newly discovered asset from the Recon module into the platform.
+        Ignores duplicates.
+        """
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.cursor.execute('''
+            INSERT OR IGNORE INTO assets (target, asset_type, root_domain, open_ports, state_hash, discovered_at, last_scanned)
+            VALUES (?, ?, ?, '[]', 'initial', ?, ?)
+        ''', (target, asset_type, root_domain, now, now))
+        self.conn.commit()
+
+    def get_active_targets(self):
+        """
+        Fetches all known targets for the Orchestrator's continuous pulse loop.
+        """
+        self.cursor.execute('SELECT target FROM assets')
+        return [row[0] for row in self.cursor.fetchall()]
+
+    def update_asset_state(self, target, ports, state_hash):
+        """
+        Core Diffing Engine. Analyzes the delta and returns newly opened ports.
+        """
+        # Ensure the asset exists in the DB first (in case it was manually fed)
+        self.add_asset(target, "unknown", "unknown")
         
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                ip_address TEXT,
-                alert_type TEXT,
-                description TEXT
-            )
-        ''')
-        self.conn.commit()
-        print("[*] Foundation built: Database initialized and schema loaded.")
+        self.cursor.execute('SELECT open_ports, state_hash FROM assets WHERE target = ?', (target,))
+        result = self.cursor.fetchone()
 
-    def update_asset_state(self, ip_address, current_ports, current_hash):
-        """The diffing logic. Compares current scan data against the database."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        current_ports_json = json.dumps(current_ports)
-        newly_opened_ports = [] # Default to empty
+        new_ports_detected = []
 
-        self.cursor.execute("SELECT open_ports, service_hash FROM assets WHERE ip_address = ?", (ip_address,))
-        row = self.cursor.fetchone()
-
-        if row is None:
-            print(f"[+] [NEW HOST] Discovered {ip_address}")
-            self.cursor.execute('''
-                INSERT INTO assets (ip_address, first_seen, last_seen, open_ports, service_hash)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (ip_address, now, now, current_ports_json, current_hash))
-            self._log_alert(ip_address, "NEW_HOST", f"Discovered with ports {current_ports}")
-            newly_opened_ports = current_ports # All ports are new on a new host
-        else:
-            old_ports_json, old_hash = row
-            old_ports = json.loads(old_ports_json)
-
-            added_ports = list(set(current_ports) - set(old_ports))
+        if result:
+            old_ports_str, old_hash = result
+            old_ports = json.loads(old_ports_str) if old_ports_str else []
             
-            if added_ports:
-                print(f"[!] [STATE CHANGE] {ip_address} opened new ports: {added_ports}")
-                self._log_alert(ip_address, "PORT_OPENED", f"New ports detected: {added_ports}")
-                newly_opened_ports = added_ports # Pass the delta out
+            # Diff logic: Identify purely new attack surface
+            new_ports_detected = [p for p in ports if p not in old_ports]
             
-            if old_hash != current_hash:
-                print(f"[!] [MUTATION] {ip_address} service hash changed!")
-                self._log_alert(ip_address, "SERVICE_MUTATION", "Banner/Service hash altered.")
+            if old_hash != 'initial' and state_hash != old_hash:
+                print(f"[!] [MUTATION] {target} service hash changed!")
 
-            self.cursor.execute('''
-                UPDATE assets 
-                SET last_seen = ?, open_ports = ?, service_hash = ?
-                WHERE ip_address = ?
-            ''', (now, current_ports_json, current_hash, ip_address))
-            
-        self.conn.commit()
-        return newly_opened_ports # Send the actionable intelligence back
-
-    def _log_alert(self, ip_address, alert_type, description):
-        """Saves actionable intelligence to the database."""
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ports_json = json.dumps(ports)
         self.cursor.execute('''
-            INSERT INTO alerts (timestamp, ip_address, alert_type, description)
-            VALUES (?, ?, ?, ?)
-        ''', (now, ip_address, alert_type, description))
+            UPDATE assets 
+            SET open_ports = ?, state_hash = ?, last_scanned = ?
+            WHERE target = ?
+        ''', (ports_json, state_hash, now, target))
+        
         self.conn.commit()
+        return new_ports_detected
